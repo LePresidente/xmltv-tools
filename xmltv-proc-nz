@@ -1,0 +1,740 @@
+#!/usr/bin/python
+
+"""
+xmltv-proc-nz by Hadley Rich <hads@nice.net.nz>
+
+Licensed under the BSD License.
+
+Processes an XMLTV file in various ways. To use pipe an XML file like so;
+
+cat freeview.xml | xmltv-proc-nz > better-file.xml
+
+or;
+
+xmltv-proc-nz freeview.xml > better-file.xml
+
+"""
+#TODO: Find repeats
+#TODO: Regex replacements for categories
+
+import csv
+import logging
+import time
+import re
+import sys
+import urllib
+import json
+from xml.etree import cElementTree as ElementTree
+from datetime import datetime, timedelta, tzinfo
+from optparse import OptionParser
+try:
+    import tmdb
+except ImportError:
+    tmdb = False
+try:
+    import tvdb_api
+except ImportError:
+    tvdb = False
+else:
+    tvdb = tvdb_api.Tvdb(language='en')
+
+NAME = 'xmltv-proc-nz'
+URL = 'http://nice.net.nz/xmltv-proc-nz'
+VERSION = '0.5.9'
+BASE_URL = 'http://nzepg.org'
+TIME_FORMAT = '%Y%m%d%H%M%S'
+
+log = logging.getLogger(NAME)
+logging.basicConfig(level=logging.WARNING, format='%(message)s')
+
+class UTC(tzinfo):
+    """
+    Represents the UTC timezone
+    """
+
+    def utcoffset(self, dt):
+        return timedelta(0)
+
+    def tzname(self, dt):
+        return "UTC"
+
+    def dst(self, dt):
+        return timedelta(0)
+
+class LocalTimezone(tzinfo):
+    """
+    Represents the computers local timezone
+    """
+
+    def __init__(self):
+        self.STDOFFSET = timedelta(seconds = -time.timezone)
+        if time.daylight:
+            self.DSTOFFSET = timedelta(seconds = -time.altzone)
+        else:
+            self.DSTOFFSET = self.STDOFFSET
+
+        self.DSTDIFF = self.DSTOFFSET - self.STDOFFSET
+        tzinfo.__init__(self)
+
+    def utcoffset(self, dt):
+        if self._isdst(dt):
+            return self.DSTOFFSET
+        else:
+            return self.STDOFFSET
+
+    def dst(self, dt):
+        if self._isdst(dt):
+            return self.DSTDIFF
+        else:
+            return timedelta(0)
+
+    def tzname(self, dt):
+        return time.tzname[self._isdst(dt)]
+
+    def _isdst(self, dt):
+        tt = (dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second, dt.weekday(), 0, -1)
+        stamp = time.mktime(tt)
+        tt = time.localtime(stamp)
+        return tt.tm_isdst > 0
+
+localtz = LocalTimezone()
+utc = UTC()
+
+class Opener(urllib.FancyURLopener):
+    version = '%s/%s' % (NAME, VERSION)
+
+urllib._urlopener = Opener()
+
+class BaseProcessor(object):
+    valid = True
+    
+    def __call__(self, programme):
+        raise NotImplementedError
+
+    def post_process(self, programmes):
+        raise NotImplementedError
+
+class Overrides(BaseProcessor):
+    """
+    Use a web service to override shows in specific timeslots.
+    """
+    def __init__(self):
+        if not tvdb:
+            log.warning('Overrides: tvdb_api module not found.')
+        try:
+            data = urllib.urlopen('%s/overrides/+json' % BASE_URL).read()
+        except IOError:
+            self.valid = False
+            log.warning('Overrides: Fetching data failed.')
+        else:
+            try:
+                self.overrides = json.loads(data)
+            except ValueError:
+                self.valid = False
+                log.warning('Overrides: JSON parse failed.')
+            else:
+                for o in self.overrides:
+                    o['start'] = datetime.strptime(o['start'], '%Y-%m-%d %H:%M:%S')
+                    o['start'] = o['start'].replace(tzinfo=utc)
+                    o['start'] = o['start'].astimezone(localtz)
+                    o['start'] = o['start'].replace(tzinfo=None)
+
+    def __call__(self, programme):
+        if not self.valid:
+            return
+
+        try:
+            start = programme.get('start')
+            stop = programme.get('stop')
+            if ' ' in start:
+                start, offset = start.split(' ')
+            if ' ' in stop:
+                stop = stop.split(' ')[0]
+            start = datetime.strptime(start, TIME_FORMAT)
+            stop = datetime.strptime(stop, TIME_FORMAT)
+            channel = programme.get('channel')
+        except:
+            log.debug('Overrides: Ignoring invalid programme')
+            return
+
+        for o in self.overrides:
+            if start == o['start'] and channel == o['xmltvid']:
+                log.info('Overrides: Found program on %s at %s', channel, start)
+                if programme.find('previously-shown') is not None:
+                    programme.remove(programme.find('previously-shown'))
+                if 'previously_shown' in o and o['previously_shown']:
+                    previously_shown = ElementTree.SubElement(programme, 'previously-shown')
+                if 'season' in o and o['season'] and 'episode' in o and o['episode']:
+                    if programme.find('episode-num') is not None:
+                        programme.remove(programme.find('episode-num'))
+                    episode_num = ElementTree.SubElement(programme, 'episode-num')
+                    episode_num.set('system', 'xmltv_ns')
+                    episode_num.text = '%s.%s.0' % (o['season'] - 1, o['episode'] - 1)
+                    if tvdb and 'tvdb_id' in o and o['tvdb_id']:
+                        show = tvdb[o['tvdb_id']]
+                        try:
+                            episode = show[o['season']][o['episode']]
+                        except:
+                            log.error('Error getting episode %02dx%02d of %s', o['season'], o['episode'], o['tvdb_id'])
+                            continue
+                        log.info(
+                            'Overrides: Using %s - %02dx%02d - %s',
+                            show['seriesname'],
+                            int(episode['seasonnumber']),
+                            int(episode['episodenumber']),
+                            episode['episodename']
+                        )
+                        if 'firstaired' in episode and episode['firstaired']:
+                            if programme.find('date') is not None:
+                                programme.remove(programme.find('date'))
+                            date = ElementTree.SubElement(programme, 'date')
+                            date.text = episode['firstaired'].replace('-', '')
+                        if programme.find('sub-title') is not None:
+                            programme.remove(programme.find('sub-title'))
+                        sub_title = ElementTree.SubElement(programme, 'sub-title')
+                        sub_title.text = episode['episodename']
+                        if programme.find('desc') is not None:
+                            if episode['overview']:
+                                programme.find('desc').text = episode['overview']
+                        else:
+                            desc = ElementTree.SubElement(programme, 'desc')
+                            desc.text = episode['overview']
+                        if 'rating' in episode and episode['rating']:
+                            if programme.find('star-rating') is not None:
+                                programme.remove(programme.find('star-rating'))
+                            rating = ElementTree.SubElement(programme, 'star-rating')
+                            value = ElementTree.SubElement(rating, 'value')
+                            value.text = '%s/10' % episode['rating']
+
+class PlusOnes(BaseProcessor):
+    def __init__(self, *xmltvids):
+        self.xmltvids = xmltvids
+
+    def __call__(self, programme):
+        if programme.get('channel') in self.xmltvids:
+            previously_shown = ElementTree.SubElement(programme, 'previously-shown')
+
+class BBCWorldOnTV1(BaseProcessor):
+    programmes_to_delete = []
+    programmes_to_insert = []
+    bbc_programmes = []
+    url = 'http://www.bbcworldnews.com' + \
+        '/Pages/SchedulesByFormats.aspx?TimeZone=348' + \
+        '&StartDate=%s&EndDate=%s&Format=CSV'
+
+    def __init__(self, *xmltvids):
+        self.xmltvids = xmltvids
+        today = datetime.now().strftime('%d/%m/%Y')
+        week_away = (datetime.now() + timedelta(days=7)).strftime('%d/%m/%Y')
+        try:
+            log.debug('BBCWorldOnTV1: Downloading data')
+            data = urllib.urlopen(self.url % (today, week_away)).read()
+            data = data.replace('\r', '')
+        except IOError:
+            self.valid = False
+            log.warning('BBCWorldOnTV1: Fetching listings failed.')
+        else:
+            reader = csv.reader(data.split(',\n'))
+            header = reader.next()
+            try:
+                for line in reader:
+                    programme = {
+                        'title': line[2],
+                        'start': datetime.strptime('%s %s' % (line[0], line[1]), '%d/%m/%Y %H:%M'),
+                        'stop': None,
+                        'sub-title': line[3],
+                        'desc': line[4],
+                        'repeat': False,
+                    }
+                    if ' (r)' in programme['title']:
+                        programme['repeat'] = True
+                        programme['title'] = programme['title'].replace(' (r)', '')
+                    self.bbc_programmes.append(programme)
+            except IndexError:
+                pass
+
+            stop = None
+            self.bbc_programmes.reverse()
+            for programme in self.bbc_programmes:
+                if stop:
+                    programme['stop'] = stop
+                stop = programme['start']
+            self.bbc_programmes.reverse()
+
+    def __call__(self, programme):
+        if not self.valid:
+            return
+
+        try:
+            start = programme.get('start')
+            stop = programme.get('stop')
+            if ' ' in start:
+                start, offset = start.split(' ')
+            if ' ' in stop:
+                stop = stop.split(' ')[0]
+            start = datetime.strptime(start, TIME_FORMAT)
+            stop = datetime.strptime(stop, TIME_FORMAT)
+            title = programme.find('title').text
+            channel = programme.get('channel')
+        except:
+            log.debug('BBCWorldOnTV1: Ignoring invalid programme')
+            return
+
+        if channel in self.xmltvids and re.match(r'^BBC World( \d{4})?$', title):
+            for op in self.bbc_programmes:
+                if (op['stop'] and op['stop'] > start and op['start'] < stop) or op['start'] > start and op['start'] < stop:
+                    np = ElementTree.Element('programme')
+                    if op['start'] < start:
+                        np.set('start', start.strftime("%Y%m%d%H%M%S %z") + offset)
+                    else:
+                        np.set('start', op['start'].strftime("%Y%m%d%H%M%S %z") + offset)
+                    if op['stop']:
+                        if op['stop'] > stop:
+                            np.set('stop', stop.strftime("%Y%m%d%H%M%S %z") + offset)
+                        else:
+                            np.set('stop', op['stop'].strftime("%Y%m%d%H%M%S %z") + offset)
+                    np.set('channel', channel)
+                    np_title = ElementTree.SubElement(np, 'title')
+                    np_title.text = op['title']
+                    if op['sub-title']:
+                        np_subtitle = ElementTree.SubElement(np, 'sub-title')
+                        np_subtitle.text = op['sub-title']
+                    if op['desc']:
+                        np_desc = ElementTree.SubElement(np, 'desc')
+                        np_desc.text = op['desc']
+                    if op['repeat']:
+                        np_repeat = ElementTree.SubElement(np, 'previously-shown')
+                    self.programmes_to_insert.append(np)
+            self.programmes_to_delete.append(programme)
+
+    def post_process(self, tree):
+        for programme in self.programmes_to_delete:
+            log.debug('BBCWorldOnTV1: Removing program %s', programme.find('title').text)
+            tree.remove(programme)
+        for programme in self.programmes_to_insert:
+            log.debug('BBCWorldOnTV1: Inserting program %s', programme.find('title').text)
+            tree.append(programme)
+
+class Movies(BaseProcessor):
+    """
+    Augment movies with data from themoviedb.com
+    """
+
+    def __init__(self):
+        self.cache = {}
+        if not tmdb:
+            self.valid = False
+            log.warning('Movies: TMDB module not found.')
+        try:
+            data = urllib.urlopen('%s/movie-channels/+json' % BASE_URL).read()
+        except IOError:
+            self.valid = False
+            log.warning('Movies: Fetching channel data failed.')
+        else:
+            try:
+                self.channels = json.loads(data)
+            except ValueError:
+                self.valid = False
+                log.warning('Movies: Parsing channel data failed.')
+        try:
+            data = urllib.urlopen('%s/movie-excludes/+json' % BASE_URL).read()
+        except IOError:
+            self.valid = False
+            log.warning('Movies: Fetching exclude data failed.')
+        else:
+            try:
+                self.exclude_strings = json.loads(data)
+                self.excludes = []
+                for e in self.exclude_strings:
+                    self.excludes.append(re.compile(e))
+            except ValueError:
+                self.valid = False
+                log.warning('Movies: Parsing exclude data failed.')
+
+    def __call__(self, programme):
+        if not self.valid:
+            return
+
+        try:
+            start = programme.get('start')
+            stop = programme.get('stop')
+            title = programme.find('title').text
+            channel = programme.get('channel')
+        except:
+            log.debug('Movies: Ignoring invalid programme')
+            return
+        if stop is None:
+            return
+        # Unfortunately strptime can't handle numeric timezones so we strip it.
+        # It's only for getting possible movies so won't matter too much.
+        if ' ' in start:
+            start = start.split(' ')[0]
+        if ' ' in stop:
+            stop = stop.split(' ')[0]
+        start_time = time.mktime(time.strptime(start, TIME_FORMAT))
+        stop_time = time.mktime(time.strptime(stop, TIME_FORMAT))
+        duration = stop_time - start_time
+        if duration <= 5400 or duration > 14400: # Between 90 mins and 4 hours
+            return
+        if channel not in self.channels:
+            return
+        for regex in self.excludes:
+            if regex.match(title):
+                return
+        log.debug('Movies: Possible movie "%s" (duration %dm)', title, duration/60)
+        movie = None
+        if title in self.cache:
+            if self.cache[title] is None:
+                log.debug('Movies: Cached ignore for "%s"', title)
+                return
+            else:
+                movie = self.cache[title]
+                log.debug('Movies: Cache hit for "%s"', title)
+        else:
+            try:
+                results = tmdb.search(title.replace('?', ''))
+            except:
+                log.exception('Movies: TMDB problem searching')
+                return
+            matches = []
+            for result in results:
+                if normalise_movie_title(title) == normalise_movie_title(result['name']) and result['language'] == 'en':
+                    matches.append(result)
+            log.debug('Movies: Exact title matches: %d', len(matches))
+            for movie in matches:
+                log.debug('Movies: Found match "%s" (%s)', movie['name'], movie['released'])
+            if len(matches) == 1:
+                try:
+                    log.debug('Movies: Cache miss for "%s"', title)
+                    movie = tmdb.getMovieInfo(matches[0]['id'])
+                except:
+                    log.exception('Movies: TMDB problem fetching info')
+                    return
+                self.cache[title] = movie
+            else:
+                self.cache[title] = None
+                return
+
+        log.info('Movies: Adding info from TMDB for %s', title)
+        show_type = ElementTree.SubElement(programme, 'category')
+        show_type.text = 'movie'
+        if 'categories' in movie and 'genre' in movie['categories']:
+            for c in movie['categories']['genre']:
+                exists = False
+                for old_cat in programme.findall('category'):
+                    if old_cat.text == c:
+                        exists = True
+                if not exists:
+                    category = ElementTree.SubElement(programme, 'category')
+                    category.text = c
+        if 'overview' in movie and movie['overview']:
+            if programme.find('desc') is not None:
+                programme.find('desc').text = movie['overview']
+            else:
+                desc = ElementTree.SubElement(programme, 'desc')
+                desc.text = movie['overview']
+        if 'url' in movie and movie['url']:
+            if programme.find('url') is not None:
+                programme.find('url').text = movie['url']
+            else:
+                url = ElementTree.SubElement(programme, 'url')
+                url.text = movie['url']
+        if 'runtime' in movie and movie['runtime']:
+            if programme.find('length') is not None:
+                programme.remove(programme.find('length'))
+            length = ElementTree.SubElement(programme, 'length')
+            length.set('units', 'minutes')
+            length.text = movie['runtime']
+        if 'released' in movie and movie['released']:
+            if programme.find('date') is not None:
+                programme.find('date').text = movie['released'].replace('-', '')
+            else:
+                date = ElementTree.SubElement(programme, 'date')
+                date.text = movie['released'].replace('-', '')
+        if 'rating' in movie and movie['rating']:
+            if programme.find('star-rating') is not None:
+                programme.remove(programme.find('star-rating'))
+            rating = ElementTree.SubElement(programme, 'star-rating')
+            value = ElementTree.SubElement(rating, 'value')
+            value.text = '%s/10' % movie['rating']
+        if 'cast' in movie:
+            if programme.find('credits') is not None:
+                programme.remove(programme.find('credits'))
+            credits = ElementTree.SubElement(programme, 'credits')
+            directors = []
+            actors = []
+            if 'director' in movie['cast']:
+                for d in movie['cast']['director']:
+                    director = ElementTree.SubElement(credits, 'director')
+                    director.text = d['name']
+            if 'actor' in movie['cast']:
+                for a in movie['cast']['actor']:
+                    actor = ElementTree.SubElement(credits, 'actor')
+                    actor.text = a['name']
+                    actor.set('role', a['character'])
+
+class HD(BaseProcessor):
+    """
+    Look for a HD note in a description.
+    """
+    regexes = (
+        re.compile(r'HD\.?$'),
+        re.compile(r'\(HD\)$'),
+    )
+
+    def __call__(self, programme):
+        desc = programme.find('desc')
+        if desc is not None and desc.text:
+            for regex in self.regexes:
+                matched = regex.search(desc.text)
+                if matched:
+                    log.debug('HD: Found "%s"', programme.find('title').text)
+                    if programme.find('video') is not None:
+                        if programme.find('quality') is None:
+                            quality = ElementTree.SubElement(programme.find('video'), 'quality')
+                            quality.text = 'HDTV'
+                        elif programme.find('quality').text != 'HDTV':
+                            programme.find('quality').text = 'HDTV'
+                    else:
+                        video = ElementTree.SubElement(programme, 'video')
+                        present = ElementTree.SubElement(video, 'present')
+                        present.text = 'yes'
+                        aspect = ElementTree.SubElement(video, 'aspect')
+                        aspect.text = '16:9'
+                        quality = ElementTree.SubElement(video, 'quality')
+                        quality.text = 'HDTV'
+                    desc.text = regex.sub('', desc.text)
+
+class Subtitle(BaseProcessor):
+    """
+    Look for a subtitle in a description.
+    """
+    regexes = (
+        re.compile(r"(Today|Tonight)?:? ?'(?P<subtitle>.*?)'\.\s?"),
+        re.compile(r"'(?P<subtitle>.{2,60}?)\.'\s"),
+        re.compile(r"(?P<subtitle>.{2,60}?):\s"),
+    )
+
+    def __call__(self, programme):
+        desc = programme.find('desc')
+        if desc is not None and desc.text:
+            for regex in self.regexes:
+                matched = regex.match(desc.text)
+                if matched and 'subtitle' not in programme:
+                    subtitle = ElementTree.SubElement(programme, 'sub-title')
+                    subtitle.text = matched.group('subtitle')
+                    log.debug('Subtitle: "%s" for "%s"', subtitle.text, programme.find('title').text)
+                    desc.text = regex.sub('', desc.text)
+
+class SearchReplaceTitle(BaseProcessor):
+    """
+    Use a web service to normalise titles.
+    """
+    def __init__(self):
+        try:
+            data = urllib.urlopen('%s/title-replacements/+json' % BASE_URL).read()
+        except IOError:
+            self.valid = False
+            log.warning('SearchReplaceTitle: Fetching replacements failed.')
+        else:
+            try:
+                self.replacements = json.loads(data)
+            except ValueError:
+                self.valid = False
+                log.warning('SearchReplaceTitle: JSON parse failed.')
+
+    def __call__(self, programme):
+        if not self.valid:
+            return
+
+        for r in self.replacements:
+            old_title = programme.find('title').text
+            if re.match(r['search'], old_title):
+                if r['description_match']:
+                    # If there's a description_match then make sure the programme
+                    # has a desc and it matches
+                    desc = programme.find('desc')
+                    if desc is None:
+                        continue
+                    if not re.match(r['description_match'], desc.text):
+                        continue
+                    desc.text = re.sub(r['description_match'], '', desc.text)
+                programme.find('title').text = re.sub(r['search'], r['replace'], programme.find('title').text)
+                if old_title != programme.find('title').text:
+                    log.info(
+                        'SearchReplaceTitle: Changed from "%s" to "%s"',
+                        old_title,
+                        programme.find('title').text
+                    )
+
+class Categories(BaseProcessor):
+    """
+    Use a web service to add categories by title.
+    """
+    def __init__(self):
+        try:
+            data = urllib.urlopen('%s/categories/+json' % BASE_URL).read()
+        except IOError:
+            self.valid = False
+            log.warning('Categories: Fetching data failed.')
+        else:
+            try:
+                self.categories = json.loads(data)
+            except ValueError:
+                self.valid = False
+                log.warning('Categories: JSON parse failed.')
+
+    def __call__(self, programme):
+        if self.valid:
+            for c in self.categories:
+                if 'category' not in c:
+                    continue
+                if programme.find('title').text == c['title']:
+                    # Remove existing categories
+                    for category in programme.findall('category'):
+                        programme.remove(category)
+                    show_type = ElementTree.SubElement(programme, 'category')
+                    show_type.text = c['show_type']
+                    if 'categories' in c:
+                        for newcat in c['categories']:
+                            category = ElementTree.SubElement(programme, 'category')
+                            category.text = newcat
+                    log.info(
+                        'Categories: Added categories for "%s"',
+                        programme.find('title').text
+                    )
+
+def compare_programme(x, y):
+    """
+       Comparison helper to sort the children elements of an
+       XMLTV programme tag.
+    """
+    programme_order = (
+        'title', 'sub-title', 'desc', 'credits', 'date',
+        'category', 'language', 'orig-language', 'length',
+        'icon', 'url', 'country', 'episode-num', 'video', 'audio',
+        'previously-shown', 'premiere', 'last-chance', 'new',
+        'subtitles', 'rating', 'star-rating',
+    )
+    if programme_order.index(x.tag) < programme_order.index(y.tag):
+        return -1
+    elif programme_order.index(x.tag) > programme_order.index(y.tag):
+        return 1
+    else:
+        return 0
+
+def normalise_movie_title(title):
+    """
+    Normalise titles to help comparisons.
+    """
+    normalised = title.lower()
+    if normalised.startswith('the '):
+        normalised = normalised[4:]
+    normalised = re.sub('[^a-z ]', '', normalised)
+    normalised = re.sub(' +', ' ', normalised)
+    normalised = normalised.replace(' the ', ' ')
+    return normalised
+
+def indent(elem, level=0):
+    """
+    Make ElementTree output pretty.
+    """
+    i = "\n" + level * "\t"
+    if len(elem):
+        if not elem.text or not elem.text.strip():
+            elem.text = i + "\t"
+        if not elem.tail or not elem.tail.strip():
+            elem.tail = i
+        for elem in elem:
+            indent(elem, level+1)
+        if not elem.tail or not elem.tail.strip():
+            elem.tail = i
+    else:
+        if level and (not elem.tail or not elem.tail.strip()):
+            elem.tail = i
+
+def check_for_updates():
+    """
+    Check for script updates.
+    """
+    try:
+        data = urllib.urlopen('%s/xmltv-proc-nz/+json' % BASE_URL).read()
+    except IOError:
+        log.critical('Cannot access Internet')
+        sys.exit(3)
+    else:
+        try:
+            stats = json.loads(data)
+        except ValueError, e:
+            print e
+            log.critical('Version check failed')
+            sys.exit(4)
+        if stats['version'] > VERSION:
+            log.warning(
+                'A new version (%s) is available at %s (current version %s)',
+                stats['version'],
+                URL,
+                VERSION
+            )
+            if stats['critical']:
+                log.critical('Version update is critical, exiting')
+                sys.exit(5)
+
+if __name__ == '__main__':
+    parser = OptionParser(version='%prog ' + str(VERSION))
+    parser.set_defaults(debug=False)
+    parser.add_option('--debug', action='store_true',
+        help='output debugging information.')
+    parser.add_option('--verbose', action='store_true',
+        help='output verbose information.')
+    (options, args) = parser.parse_args()
+
+    if options.verbose:
+        log.setLevel(logging.INFO)
+
+    if options.debug:
+        log.setLevel(logging.DEBUG)
+
+    check_for_updates()
+
+    if sys.stdin.isatty():
+        if len(args) == 0:
+            log.critical('No input file')
+            sys.exit(2)
+        data = open(args[0]).read()
+    else:
+        data = sys.stdin.read()
+
+    processors = [
+        BBCWorldOnTV1('tv1.freeviewnz.tv'),
+        PlusOnes('tv3-plus1.freeviewnz.tv'),
+        SearchReplaceTitle(),
+        Subtitle(),
+        Categories(),
+        Movies(),
+        HD(),
+        Overrides(),
+    ]
+
+    tree = ElementTree.XML(data)
+    for processor in processors:
+        for programme in tree.findall('.//programme'):
+            try:
+                processor(programme)
+            except:
+                log.exception("Failed processing with processor: %s", processor)
+	try:
+	    processor.post_process(tree)
+	except NotImplementedError:
+	    pass
+	except:
+	    log.exception("Failed post processing with processor: %s", processor)
+
+    for programme in tree.findall('.//programme'):
+        programme[:] = sorted(programme, compare_programme)
+
+    print '<?xml version="1.0" encoding="utf-8"?>'
+    print '<!DOCTYPE tv SYSTEM "xmltv.dtd">'
+    indent(tree)
+    ElementTree.dump(tree)
+
