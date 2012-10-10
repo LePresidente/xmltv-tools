@@ -744,18 +744,18 @@ if __name__ == '__main__':
                 processor(programme)
             except:
                 log.exception("Failed processing with processor: %s", processor)
-	try:
-	    processor.post_process(tree)
-	except NotImplementedError:
-	    pass
-	except:
-	    log.exception("Failed post processing with processor: %s", processor)
+    try:
+        processor.post_process(tree)
+    except NotImplementedError:
+        pass
+    except:
+        log.exception("Failed post processing with processor: %s", processor)
 
     for programme in tree.findall('.//programme'):
         programme[:] = sorted(programme, compare_programme)
 
+    indent(tree)
     print '<?xml version="1.0" encoding="utf-8"?>'
     print '<!DOCTYPE tv SYSTEM "xmltv.dtd">'
-    indent(tree)
-    ElementTree.dump(tree)
+    print ElementTree.tostring(tree, encoding='utf-8')
 
