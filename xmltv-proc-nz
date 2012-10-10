@@ -526,6 +526,26 @@ class Subtitle(BaseProcessor):
                     log.debug('Subtitle: "%s" for "%s"', subtitle.text, programme.find('title').text)
                     desc.text = regex.sub('', desc.text)
 
+class EpDesc(BaseProcessor):
+    """
+    Look for a Season/Episode info in a description.
+    """
+    regexes = (
+        re.compile(r' S\s?(\d+) Ep\s?(\d+)'),
+    )
+
+    def __call__(self, programme):
+        desc = programme.find('desc')
+        if desc is not None and desc.text:
+            for regex in self.regexes:
+                matched = regex.search(desc.text)
+                if matched:
+                    season, episode = [int(x) for x in matched.groups()]
+                    log.debug('EpDesc: Found season %s episode %s for "%s"', (season, episode, programme.find('title').text))
+                    episode_num = ElementTree.SubElement(programme, 'episode-num')
+                    episode_num.set('system', 'xmltv_ns')
+                    episode_num.text = '%s.%s.0' % (season - 1, episode - 1)
+
 class SearchReplaceTitle(BaseProcessor):
     """
     Use a web service to normalise titles.
@@ -713,6 +733,7 @@ if __name__ == '__main__':
         Categories(),
         Movies(),
         HD(),
+        EpDesc(),
         Overrides(),
     ]
 
