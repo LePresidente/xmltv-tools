@@ -239,11 +239,11 @@ class BBCWorldOnTV1(BaseProcessor):
             try:
                 for line in reader:
                     programme = {
-                        'title': line[2],
+                        'title': unicode(line[2], 'utf-8').encode('ascii', 'replace'),
                         'start': datetime.strptime('%s %s' % (line[0], line[1]), '%d/%m/%Y %H:%M'),
                         'stop': None,
-                        'sub-title': line[3],
-                        'desc': line[4],
+                        'sub-title': unicode(line[3], 'utf-8').encode('ascii', 'replace'),
+                        'desc': unicode(line[4], 'utf-8').encode('ascii', 'replace'),
                         'repeat': False,
                     }
                     if ' (r)' in programme['title']:
