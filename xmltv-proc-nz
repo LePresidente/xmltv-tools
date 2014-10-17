@@ -1,7 +1,8 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 
 """
 xmltv-proc-nz by Hadley Rich <hads@nice.net.nz>
+Contributions by Aaron Pelly <aaron@pelly.co>
 
 Licensed under the BSD License.
 
@@ -22,30 +23,37 @@ import logging
 import time
 import re
 import sys
-import urllib
-import json
+import os.path
+import io
+
 from xml.etree import cElementTree as ElementTree
 from datetime import datetime, timedelta, tzinfo
 from optparse import OptionParser
-try:
-    import tmdb
-except ImportError:
-    tmdb = False
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors='replace')
+
 try:
     import tvdb_api
 except ImportError:
+    log.warning("Failed to import TVDB module. No TV show enhancements can be made.")
     tvdb = False
 else:
-    tvdb = tvdb_api.Tvdb(language='en')
+    tvdb = True
+
+try:
+    import tmdb3
+except ImportError:
+    log.warning("Failed to import TMDB3 module. No movie enhancements can be made.")
+    tmdb = False
+else:
+    tmdb = True
 
 NAME = 'xmltv-proc-nz'
-URL = 'http://nice.net.nz/xmltv-proc-nz'
-VERSION = '0.5.9'
-BASE_URL = 'http://nzepg.org'
+VERSION = '0.5.10a1'
 TIME_FORMAT = '%Y%m%d%H%M%S'
 
 log = logging.getLogger(NAME)
 logging.basicConfig(level=logging.WARNING, format='%(message)s')
+
 
 class UTC(tzinfo):
     """
@@ -60,6 +68,7 @@ class UTC(tzinfo):
 
     def dst(self, dt):
         return timedelta(0)
+
 
 class LocalTimezone(tzinfo):
     """
@@ -97,13 +106,10 @@ class LocalTimezone(tzinfo):
         tt = time.localtime(stamp)
         return tt.tm_isdst > 0
 
+
 localtz = LocalTimezone()
 utc = UTC()
 
-class Opener(urllib.FancyURLopener):
-    version = '%s/%s' % (NAME, VERSION)
-
-urllib._urlopener = Opener()
 
 class BaseProcessor(object):
     valid = True
@@ -114,6 +120,8 @@ class BaseProcessor(object):
     def post_process(self, programmes):
         raise NotImplementedError
 
+
+# Class Overrides is currently unused and unsupported. might adapt it later if there is a need for it.
 class Overrides(BaseProcessor):
     """
     Use a web service to override shows in specific timeslots.
@@ -122,7 +130,7 @@ class Overrides(BaseProcessor):
         if not tvdb:
             log.warning('Overrides: tvdb_api module not found.')
         try:
-            data = urllib.urlopen('%s/overrides/+json' % BASE_URL).read()
+            data = urllib.request.urlopen('%s/overrides/+json' % BASE_URL).read()
         except IOError:
             self.valid = False
             log.warning('Overrides: Fetching data failed.')
@@ -206,6 +214,8 @@ class Overrides(BaseProcessor):
                             value = ElementTree.SubElement(rating, 'value')
                             value.text = '%s/10' % episode['rating']
 
+
+# Class PlusOnes is not currently implemented
 class PlusOnes(BaseProcessor):
     def __init__(self, *xmltvids):
         self.xmltvids = xmltvids
@@ -214,6 +224,8 @@ class PlusOnes(BaseProcessor):
         if programme.get('channel') in self.xmltvids:
             previously_shown = ElementTree.SubElement(programme, 'previously-shown')
 
+
+# Class BBCWorldOnTV1 is not currently implemented. Not a lot of point unless TV1 resumes re-broadvasting BBC World.
 class BBCWorldOnTV1(BaseProcessor):
     programmes_to_delete = []
     programmes_to_insert = []
@@ -228,22 +240,22 @@ class BBCWorldOnTV1(BaseProcessor):
         week_away = (datetime.now() + timedelta(days=7)).strftime('%d/%m/%Y')
         try:
             log.debug('BBCWorldOnTV1: Downloading data')
-            data = urllib.urlopen(self.url % (today, week_away)).read()
+            data = urllib.request.urlopen(self.url % (today, week_away)).read()
             data = data.replace('\r', '')
         except IOError:
             self.valid = False
             log.warning('BBCWorldOnTV1: Fetching listings failed.')
         else:
             reader = csv.reader(data.split(',\n'))
-            header = reader.next()
+            header = next(reader)
             try:
                 for line in reader:
                     programme = {
-                        'title': unicode(line[2], 'utf-8').encode('ascii', 'replace'),
+                        'title': str(line[2], 'utf-8').encode('ascii', 'replace'),
                         'start': datetime.strptime('%s %s' % (line[0], line[1]), '%d/%m/%Y %H:%M'),
                         'stop': None,
-                        'sub-title': unicode(line[3], 'utf-8').encode('ascii', 'replace'),
-                        'desc': unicode(line[4], 'utf-8').encode('ascii', 'replace'),
+                        'sub-title': str(line[3], 'utf-8').encode('ascii', 'replace'),
+                        'desc': str(line[4], 'utf-8').encode('ascii', 'replace'),
                         'repeat': False,
                     }
                     if ' (r)' in programme['title']:
@@ -320,36 +332,56 @@ class Movies(BaseProcessor):
     Augment movies with data from themoviedb.com
     """
 
-    def __init__(self):
+    def __init__(self, config):
         self.cache = {}
         if not tmdb:
             self.valid = False
             log.warning('Movies: TMDB module not found.')
+            return
+
+        # TMDB API key
         try:
-            data = urllib.urlopen('%s/movie-channels/+json' % BASE_URL).read()
-        except IOError:
+            TMDB_API_key = config.find("TMDB/API_KEY").text
+        except:
+            TMDB_API_key = None
+
+        if TMDB_API_key is None or TMDB_API_key == "YourKeyHere":
             self.valid = False
-            log.warning('Movies: Fetching channel data failed.')
-        else:
+            log.critical("TMDB API key missing from '"+config_file+"'")
+            return
+
+        log.debug("Using TMDB API key %s", TMDB_API_key)
+        tmdb3.set_key(TMDB_API_key)
+
+        # Movies options
+        # locate the correct part of the config file
+        section = config.find("MOVIES")
+#TODO: this needs a section for 'exclude shows starting between these times on this channel' or something like that. eg breakfast on tv1
+        # loop through the excluded channels
+        self.exclude_channels = []
+        for ExcludeChannel in section.findall("EXCLUDE_CHANNELS/CHANNEL"):
+#TODO: Really need some better validation on the XML data I think, or an easy way to test new configs.
+            if ExcludeChannel.text:
+                log.debug('Movies: Adding excluded channel "%s"', ExcludeChannel.text)
+                self.exclude_channels.append(ExcludeChannel.text)
+        if not self.exclude_channels:
+            log.info("Movies: No excluded channel configuration found in '"+config_file+"'")
+
+        self.exclude_strings = []
+        for ExcludeString in section.findall("EXCLUDE_STRINGS/STRING"):
+#TODO: Really need some better validation on the XML data I think, or an easy way to test new configs.
+            if ExcludeString.text:
+                log.debug('Movies: Adding excluded string "%s"', ExcludeString.text)
+                self.exclude_strings.append(ExcludeString.text)
+        if not self.exclude_strings:
+            log.info("Movies: No excluded channel configuration found in '"+config_file+"'")
+        self.excludes = []
+        for e in self.exclude_strings:
             try:
-                self.channels = json.loads(data)
+                self.excludes.append(re.compile(e))
             except ValueError:
                 self.valid = False
-                log.warning('Movies: Parsing channel data failed.')
-        try:
-            data = urllib.urlopen('%s/movie-excludes/+json' % BASE_URL).read()
-        except IOError:
-            self.valid = False
-            log.warning('Movies: Fetching exclude data failed.')
-        else:
-            try:
-                self.exclude_strings = json.loads(data)
-                self.excludes = []
-                for e in self.exclude_strings:
-                    self.excludes.append(re.compile(e))
-            except ValueError:
-                self.valid = False
-                log.warning('Movies: Parsing exclude data failed.')
+                log.warning('Movies: Parsing RegEx exclude string "%s" failed.', e)
 
     def __call__(self, programme):
         if not self.valid:
@@ -374,14 +406,22 @@ class Movies(BaseProcessor):
         start_time = time.mktime(time.strptime(start, TIME_FORMAT))
         stop_time = time.mktime(time.strptime(stop, TIME_FORMAT))
         duration = stop_time - start_time
-        if duration <= 5400 or duration > 14400: # Between 90 mins and 4 hours
-            return
-        if channel not in self.channels:
-            return
-        for regex in self.excludes:
-            if regex.match(title):
+        # always look up things in the movie category. try to identify others by duration/channel/title
+        MovieCat = False
+        for cat in programme.findall('category'):
+            if cat.text != "Movie":
+                MovieCat = True
+        if not MovieCat:
+            if duration <= 5400 or duration > 14400: # Between 90 mins and 4 hours
                 return
-        log.debug('Movies: Possible movie "%s" (duration %dm)', title, duration/60)
+            if channel in self.exclude_channels:
+                log.debug('Movies: Excluding channel "%s"', channel)
+                return
+            for regex in self.excludes:
+                if regex.match(title):
+                    log.debug('Movies: Excluding title "%s"', title)
+                    return
+        log.debug('Movies: Possible movie "%s" (duration %dm) on channel "%s"', title, duration/60, channel)
         movie = None
         if title in self.cache:
             if self.cache[title] is None:
@@ -392,21 +432,21 @@ class Movies(BaseProcessor):
                 log.debug('Movies: Cache hit for "%s"', title)
         else:
             try:
-                results = tmdb.search(title.replace('?', ''))
+                results = tmdb3.searchMovie(title.replace('?', ''))
             except:
                 log.exception('Movies: TMDB problem searching')
                 return
             matches = []
             for result in results:
-                if normalise_movie_title(title) == normalise_movie_title(result['name']) and result['language'] == 'en':
+                if normalise_movie_title(title) == normalise_movie_title(result.title):
                     matches.append(result)
             log.debug('Movies: Exact title matches: %d', len(matches))
             for movie in matches:
-                log.debug('Movies: Found match "%s" (%s)', movie['name'], movie['released'])
+                log.debug('Movies: Found match "%s" (%s)', movie.title, movie.releasedate)
             if len(matches) == 1:
                 try:
                     log.debug('Movies: Cache miss for "%s"', title)
-                    movie = tmdb.getMovieInfo(matches[0]['id'])
+                    movie = tmdb3.Movie(matches[0].id)
                 except:
                     log.exception('Movies: TMDB problem fetching info')
                     return
@@ -416,62 +456,236 @@ class Movies(BaseProcessor):
                 return
 
         log.info('Movies: Adding info from TMDB for %s', title)
-        show_type = ElementTree.SubElement(programme, 'category')
-        show_type.text = 'movie'
-        if 'categories' in movie and 'genre' in movie['categories']:
-            for c in movie['categories']['genre']:
+        exists = False
+        for old_cat in programme.findall('category'):
+            if old_cat.text == 'Movie':
+                exists = True
+        if not exists:
+            log.info('Movies: Adding category "%s"', 'Movie')
+            category = ElementTree.SubElement(programme, 'category')
+            category.text = 'Movie'
+        if movie.genres:
+            for c in movie.genres:
                 exists = False
                 for old_cat in programme.findall('category'):
-                    if old_cat.text == c:
+                    if old_cat.text == c.name:
                         exists = True
                 if not exists:
+                    log.info('Movies: Adding category "%s"', c.name)
                     category = ElementTree.SubElement(programme, 'category')
-                    category.text = c
-        if 'overview' in movie and movie['overview']:
+                    category.text = c.name
+        if movie.overview:
+            log.info('Movies: Adding overview "%s"', movie.overview)
             if programme.find('desc') is not None:
-                programme.find('desc').text = movie['overview']
+                programme.find('desc').text = movie.overview
             else:
                 desc = ElementTree.SubElement(programme, 'desc')
-                desc.text = movie['overview']
-        if 'url' in movie and movie['url']:
+                desc.text = movie.overview
+        if movie.homepage:
+            log.info('Movies: Adding url "%s"', movie.homepage)
             if programme.find('url') is not None:
-                programme.find('url').text = movie['url']
+                programme.find('url').text = movie.homepage
             else:
                 url = ElementTree.SubElement(programme, 'url')
-                url.text = movie['url']
-        if 'runtime' in movie and movie['runtime']:
+                url.text = movie.homepage
+        if movie.runtime:
+            log.info('Movies: Adding runtime "%s"', movie.runtime)
             if programme.find('length') is not None:
                 programme.remove(programme.find('length'))
             length = ElementTree.SubElement(programme, 'length')
             length.set('units', 'minutes')
-            length.text = movie['runtime']
-        if 'released' in movie and movie['released']:
+            length.text = str(movie.runtime)
+        if movie.releasedate:
+            log.info('Movies: Adding release date "%s"', movie.releasedate)
             if programme.find('date') is not None:
-                programme.find('date').text = movie['released'].replace('-', '')
+                programme.find('date').text = movie.releasedate.replace('-', '')
             else:
                 date = ElementTree.SubElement(programme, 'date')
-                date.text = movie['released'].replace('-', '')
-        if 'rating' in movie and movie['rating']:
+                date.text = str(movie.releasedate).replace('-', '')
+        if movie.userrating:
+            log.info('Movies: Adding rating "%s"', movie.userrating)
             if programme.find('star-rating') is not None:
                 programme.remove(programme.find('star-rating'))
             rating = ElementTree.SubElement(programme, 'star-rating')
             value = ElementTree.SubElement(rating, 'value')
-            value.text = '%s/10' % movie['rating']
-        if 'cast' in movie:
+            value.text = str('%s/10' % movie.userrating)
+        if movie.cast:
             if programme.find('credits') is not None:
                 programme.remove(programme.find('credits'))
             credits = ElementTree.SubElement(programme, 'credits')
             directors = []
             actors = []
-            if 'director' in movie['cast']:
-                for d in movie['cast']['director']:
+            for d in movie.crew:
+                if d.job == "Director":
+                    log.info('Movies: Adding director "%s"', d.name)
                     director = ElementTree.SubElement(credits, 'director')
-                    director.text = d['name']
-            if 'actor' in movie['cast']:
-                for a in movie['cast']['actor']:
+                    director.text = d.name
+            if movie.cast:
+                for a in movie.cast:
+                    log.info('Movies: Adding actor "%s" as "%s"', a.name, a.character)
                     actor = ElementTree.SubElement(credits, 'actor')
-                    actor.text = a['name']
-                    actor.set('role', a['character'])
+                    actor.text = a.name
+                    actor.set('role', a.character)
+
+class Episodes(BaseProcessor):
+    """
+    Augment TV shows  with data from thetvdb.com
+    """
+
+    def __init__(self, config):
+        self.cache = {}
+        if not tvdb:
+            self.valid = False
+            log.warning('Episodes: TVDB module not found.')
+            return
+
+        # set up TVDB module
+        # TVDB API key
+        try:
+            TVDB_API_key = config.find("TVDB/API_KEY").text
+        except:
+            TVDB_API_key = None
+
+        if TVDB_API_key is None or TVDB_API_key == "YourKeyHere":
+            self.valid = False
+            log.critical("TVDB API key missing from '"+config_file+"'")
+            return
+
+        log.debug("Using TVDB API key %s", TVDB_API_key)
+        tvdb_api.Tvdb(language='en')
+        tvdb_api.Tvdb(apikey=TVDB_API_key)
+
+        # Episodes options
+        # locate the correct part of the config file
+        section = config.find("EPISODES")
+#TODO: this needs a section for 'exclude shows starting between these times on this channel' or something like that. eg breakfast on tv1
+        # loop through the excluded channels
+        self.exclude_channels = []
+        for ExcludeChannel in section.findall("EXCLUDE_CHANNELS/CHANNEL"):
+#TODO: Really need some better validation on the XML data I think, or an easy way to test new configs.
+            if ExcludeChannel.text:
+                log.debug('Episodes: Adding excluded channel "%s"', ExcludeChannel.text)
+                self.exclude_channels.append(ExcludeChannel.text)
+        if not self.exclude_channels:
+            log.info("Episodes: No excluded channel configuration found in '"+config_file+"'")
+
+        self.exclude_strings = []
+        for ExcludeString in section.findall("EXCLUDE_STRINGS/STRING"):
+#TODO: Really need some better validation on the XML data I think, or an easy way to test new configs.
+            if ExcludeString.text:
+                log.debug('Episodes: Adding excluded string "%s"', ExcludeString.text)
+                self.exclude_strings.append(ExcludeString.text)
+        if not self.exclude_strings:
+            log.info("Episodes: No excluded channel configuration found in '"+config_file+"'")
+        self.excludes = []
+        for e in self.exclude_strings:
+            try:
+                self.excludes.append(re.compile(e))
+            except ValueError:
+                self.valid = False
+                log.warning('Episodes: Parsing RegEx exclude string "%s" failed.', e)
+
+    def __call__(self, programme):
+        if not self.valid:
+            return
+
+        try:
+            start = programme.get('start')
+            stop = programme.get('stop')
+            title = programme.find('title').text
+            channel = programme.get('channel')
+            episodes = programme.findall('episode-num')
+        except:
+            log.debug('Episodes: Ignoring invalid programme')
+            return
+        if stop is None:
+            return
+        # Unfortunately strptime can't handle numeric timezones so we strip it.
+        # It's only for getting possible tv shows so won't matter too much.
+        if ' ' in start:
+            start = start.split(' ')[0]
+        if ' ' in stop:
+            stop = stop.split(' ')[0]
+        start_time = time.mktime(time.strptime(start, TIME_FORMAT))
+        stop_time = time.mktime(time.strptime(stop, TIME_FORMAT))
+        duration = stop_time - start_time
+        if duration > 5400: # give up if longer than 90 minutes
+            return
+        if channel in self.exclude_channels:
+            log.debug('Episodes: Excluding channel "%s"', channel)
+            return
+        for regex in self.excludes:
+            if regex.match(title):
+                log.debug('Episodes: Excluding title "%s"', title)
+                return
+#TODO: look at this block of code. it's probably junk.
+# not sure where this block of code came from.
+#        if title in self.cache:
+#            if self.cache[title] is None:
+#                log.debug('Episodes: Cached ignore for "%s"', title)
+#                return
+#            else:
+#                #movie = self.cache[title]
+#                log.debug('Episodes: Cache hit for "%s"', title)
+#        else:
+        try:
+            tvdb_episode=tvdb_api.Tvdb()
+            for episode in episodes:
+#TODO: is TVDB data really useless without episode numbers? There's a good chance we can find some details without...
+                if episode.get('system') == "xmltv_ns":
+                    #log.debug('Episodes: episode "%s"', episode.text)
+                    season = int(episode.text.split('.')[0])+1
+                    episode = int(episode.text.split('.')[1])+1
+
+                    log.debug('Episodes: Looking up season %s, episode %s of show "%s" at TVDB', season, episode, title)
+                    # get data from TVDB
+                    try:
+                        episodename = tvdb_episode[title][season][episode]['episodename']
+                    except tvdb_api.tvdb_shownotfound:
+                        log.debug('Episodes: Show "%s": Not listed at TVDB', title)
+                    except tvdb_api.tvdb_seasonnotfound:
+                        log.debug('Episodes: Season %s of show "%s": Not listed at TVDB', season, title)
+                    except tvdb_api.tvdb_episodenotfound:
+                        log.debug('Episodes: Season %s, episode %s of show "%s": Not listed at TVDB', season, episode, title)
+                    else:
+                        rating = tvdb_episode[title][season][episode]['rating']
+                        tvdb_id = tvdb_episode[title][season][episode]['id']
+                        genres = tvdb_episode[title]['genre']
+#TODO: add first aired date.
+                        #log.debug('Episodes: TVDB items are "%s"', list(tvdb_episode[title][season][episode].items()))
+
+                        # store the subtitle/episode name
+                        subtitle = ElementTree.SubElement(programme, 'sub-title')
+                        subtitle.text = episodename
+                        log.info('Episodes: Subtitle for "%s" is "%s"', title, episodename)
+
+                        # store the rating
+                        if rating is not None:
+                            log.info('Episodes: Adding rating "%s"', rating)
+                            if programme.find('star-rating') is not None:
+                                programme.remove(programme.find('star-rating'))
+                            urating = ElementTree.SubElement(programme, 'star-rating')
+                            value = ElementTree.SubElement(urating, 'value')
+                            value.text = str('%s/10' % rating)
+
+                        # store the genres
+                        log.debug('Episodes: genres "%s"', genres)
+                        if genres:
+                        #if 'categories' in movie and 'genre' in movie['categories']:
+                            for c in genres.split("|"):
+                                if c:
+                                    exists = False
+                                    for old_cat in programme.findall('category'):
+                                        if old_cat.text == c:
+                                            exists = True
+                                    if not exists:
+                                        log.info('Episodes: Adding category "%s"', c)
+                                        category = ElementTree.SubElement(programme, 'category')
+                                        category.text = c
+
+        except:
+            log.exception('Episodes: TVDB problem searching')
+            return
 
 class HD(BaseProcessor):
     """
@@ -530,38 +744,73 @@ class EpDesc(BaseProcessor):
     """
     Look for a Season/Episode info in a description.
     """
-    regexes = (
+    desc_regexes = (
         re.compile(r' S\s?(\d+) Ep\s?(\d+)'),
+    )
+    progid_regexes = (
+        re.compile(r'\s?(\d+)Ep\s?(\d+)'),
     )
 
     def __call__(self, programme):
         desc = programme.find('desc')
         if desc is not None and desc.text:
-            for regex in self.regexes:
+            for regex in self.desc_regexes:
                 matched = regex.search(desc.text)
                 if matched:
                     season, episode = [int(x) for x in matched.groups()]
-                    log.debug('EpDesc: Found season %s episode %s for "%s"', (season, episode, programme.find('title').text))
+                    log.debug('EpDesc: From desc: Found season %s episode %s for "%s"', season, episode, programme.find('title').text)
                     episode_num = ElementTree.SubElement(programme, 'episode-num')
                     episode_num.set('system', 'xmltv_ns')
                     episode_num.text = '%s.%s.0' % (season - 1, episode - 1)
+        # choice tv puts the season number in the guide data. lets get it!
+#TODO: they use the same format for movies. shouldn't insert those.
+        episodes = programme.findall('episode-num')
+        for episode in episodes:
+            if episode.get('system') == "dd_progid":
+                for regex in self.progid_regexes:
+                    matched = regex.search(episode.text)
+                    if matched:
+                        season, ep = [int(x) for x in matched.groups()]
+                        log.debug('EpDesc: episode "%s"', episode.text)
+                        log.debug('EpDesc: From dd_progid: Found season %s episode %s for "%s"', season, ep, programme.find('title').text)
+                        episode_num = ElementTree.SubElement(programme, 'episode-num')
+                        episode_num.set('system', 'xmltv_ns')
+                        episode_num.text = '%s.%s.0' % (season - 1, ep - 1)
 
 class SearchReplaceTitle(BaseProcessor):
     """
-    Use a web service to normalise titles.
+    Tidy up show titles that have been mangled by the NZ broadcasters
     """
-    def __init__(self):
-        try:
-            data = urllib.urlopen('%s/title-replacements/+json' % BASE_URL).read()
-        except IOError:
-            self.valid = False
-            log.warning('SearchReplaceTitle: Fetching replacements failed.')
-        else:
-            try:
-                self.replacements = json.loads(data)
-            except ValueError:
-                self.valid = False
-                log.warning('SearchReplaceTitle: JSON parse failed.')
+    def __init__(self, config):
+        # locate the correct part of the config file
+        section = config.find("REPLACE_TITLE")
+        # loop through the search terms
+        self.replacements = []
+        for search_term in section.findall("SEARCH"):
+#TODO: Really need some better validation on the XML data I think, or an easy way to test new configs.
+#TODO: Eliminate clever code below
+            # boolean voodo below to ensure a string instead of None for an empty tag
+            # https://stackoverflow.com/questions/1034573/python-most-idiomatic-way-to-convert-none-to-empty-string
+            title = search_term.find("TITLE").text
+            log.debug('SearchReplaceTitle: Found title "%s"', title)
+            desc = search_term.find("DESC").text or ''
+            log.debug('SearchReplaceTitle: Found desc "%s"', desc)
+            replacement = search_term.find("REPLACEMENT").text or ''
+            log.debug('SearchReplaceTitle: Found replacement "%s"', replacement)
+            categories = []
+            for category in search_term.findall("CATEGORIES/CATEGORY"):
+                if category.text:
+                    log.debug('SearchReplaceTitle: Found category "%s"', category)
+                    categories.append(category.text)
+            if title:
+                self.replacements.append({
+                   "search":title,
+                   "description_match":desc,
+                   "replace":replacement,
+                   "categories":categories
+                })
+            else:
+                log.warning('SearchReplaceTitle: Title can not be empty')
 
     def __call__(self, programme):
         if not self.valid:
@@ -569,7 +818,8 @@ class SearchReplaceTitle(BaseProcessor):
 
         for r in self.replacements:
             old_title = programme.find('title').text
-            if re.match(r['search'], old_title):
+            if re.search(r['search'], old_title):
+                log.info('SearchReplaceTitle: Found "%s"', r['search'])
                 if r['description_match']:
                     # If there's a description_match then make sure the programme
                     # has a desc and it matches
@@ -579,7 +829,19 @@ class SearchReplaceTitle(BaseProcessor):
                     if not re.match(r['description_match'], desc.text):
                         continue
                     desc.text = re.sub(r['description_match'], '', desc.text)
+
                 programme.find('title').text = re.sub(r['search'], r['replace'], programme.find('title').text)
+                # add categories if required
+                for category in r['categories']:
+                    exists = False
+                    for old_cat in programme.findall('category'):
+                        if old_cat.text == category:
+                            exists = True
+                    if not exists:
+                        log.info('SearchReplaceTitle: Adding category "%s"', category)
+                        cat = ElementTree.SubElement(programme, 'category')
+                        cat.text = category
+
                 if old_title != programme.find('title').text:
                     log.info(
                         'SearchReplaceTitle: Changed from "%s" to "%s"',
@@ -591,40 +853,65 @@ class Categories(BaseProcessor):
     """
     Use a web service to add categories by title.
     """
-    def __init__(self):
-        try:
-            data = urllib.urlopen('%s/categories/+json' % BASE_URL).read()
-        except IOError:
-            self.valid = False
-            log.warning('Categories: Fetching data failed.')
-        else:
-            try:
-                self.categories = json.loads(data)
-            except ValueError:
-                self.valid = False
-                log.warning('Categories: JSON parse failed.')
+    def __init__(self, config):
+        # locate the correct part of the config file
+        section = config.find("CATEGORIES")
+        # loop through the categories
+        self.categories = []
+        for search_term in section.findall("SEARCH"):
+#TODO: Really need some better validation on the XML data I think, or an easy way to test new configs.
+#TODO: Eliminate clever code below
+            # boolean voodo below to ensure a string instead of None for an empty tag
+            # https://stackoverflow.com/questions/1034573/python-most-idiomatic-way-to-convert-none-to-empty-string
+            title = search_term.find("TITLE").text or ''
+            log.debug('Categories: Adding title %s', title)
+            NewCategories = []
+            for category in search_term.findall("CATEGORIES/CATEGORY"):
+                if category.text:
+                    log.debug('Categories: Adding category %s', category.text)
+                    NewCategories.append(category.text)
+            if title:
+                self.categories.append({
+                   "title":title,
+                   "categories":NewCategories
+                })
+            else:
+                log.debug('Categories: Title can not be empty.')
+
+
+#TODO: find out why this processor had a show_type item. did/does this exist in myth? was the original code below a typo?
+# this is what the data used to look like.
+#            self.categories = [
+#                {"title":"The Simpsons", "show_type":"Series", "categories":{"Animation","Comedy"} },
+#                {"title":"Prime News", "show_type":"News" },
+#                {"title":"Media Take", "show_type":"Current Affairs", "categories":{"Media"} },
+#                {"title":"ONE News", "show_type":"News", "categories":{} }]
 
     def __call__(self, programme):
         if self.valid:
             for c in self.categories:
-                if 'category' not in c:
-                    continue
-                if programme.find('title').text == c['title']:
+                #if 'category' not in c:
+                    #continue
+                if programme.find('title').text.find(c['title']) > -1:
+                #if programme.find('title').text == c['title']:
+                    log.debug('Categories: Found for "%s"', c['title'])
                     # Remove existing categories
                     for category in programme.findall('category'):
                         programme.remove(category)
-                    show_type = ElementTree.SubElement(programme, 'category')
-                    show_type.text = c['show_type']
+#TODO: find out why this processor had a show_type item. did/does this exist in myth? was the original code below a typo?
+                    #show_type = ElementTree.SubElement(programme, 'category')
+                    #show_type.text = c['show_type']
                     if 'categories' in c:
                         for newcat in c['categories']:
                             category = ElementTree.SubElement(programme, 'category')
+                            log.debug('Categories: Adding %s', newcat)
                             category.text = newcat
                     log.info(
                         'Categories: Added categories for "%s"',
                         programme.find('title').text
                     )
 
-def compare_programme(x, y):
+def compare_programme(x):
     """
        Comparison helper to sort the children elements of an
        XMLTV programme tag.
@@ -636,12 +923,8 @@ def compare_programme(x, y):
         'previously-shown', 'premiere', 'last-chance', 'new',
         'subtitles', 'rating', 'star-rating',
     )
-    if programme_order.index(x.tag) < programme_order.index(y.tag):
-        return -1
-    elif programme_order.index(x.tag) > programme_order.index(y.tag):
-        return 1
-    else:
-        return 0
+#TODO: don't know if the fillowing line errors when not found or returns 0
+    return programme_order.index(x.tag)
 
 def normalise_movie_title(title):
     """
@@ -673,20 +956,21 @@ def indent(elem, level=0):
         if level and (not elem.tail or not elem.tail.strip()):
             elem.tail = i
 
+# legacy function. not used. may be inplemented in the future.
 def check_for_updates():
     """
     Check for script updates.
     """
     try:
-        data = urllib.urlopen('%s/xmltv-proc-nz/+json' % BASE_URL).read()
+        data = urllib.request.urlopen('%s/xmltv-proc-nz/+json' % BASE_URL).read()
     except IOError:
         log.critical('Cannot access Internet')
         sys.exit(3)
     else:
         try:
             stats = json.loads(data)
-        except ValueError, e:
-            print e
+        except ValueError as e:
+            print(e)
             log.critical('Version check failed')
             sys.exit(4)
         if stats['version'] > VERSION:
@@ -700,13 +984,26 @@ def check_for_updates():
                 log.critical('Version update is critical, exiting')
                 sys.exit(5)
 
+#############################################################################
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+#############################################################################
 if __name__ == '__main__':
+
+    config_file = "~/.mythtv/"+NAME+".xml"
+    config_file = os.path.expanduser(config_file)
+
     parser = OptionParser(version='%prog ' + str(VERSION))
     parser.set_defaults(debug=False)
-    parser.add_option('--debug', action='store_true',
+    parser.add_option('-d', '--debug', action='store_true',
         help='output debugging information.')
-    parser.add_option('--verbose', action='store_true',
+    parser.add_option('-v', '--verbose', action='store_true',
         help='output verbose information.')
+    parser.add_option('-c', '--config', action='store', metavar='FILE',
+        help='use configuration FILE instead of "'+config_file+'".')
+    parser.add_option('--configure', action='store_true',
+        help='create initial configuration file "'+config_file+'".')
     (options, args) = parser.parse_args()
 
     if options.verbose:
@@ -715,26 +1012,60 @@ if __name__ == '__main__':
     if options.debug:
         log.setLevel(logging.DEBUG)
 
-    check_for_updates()
+    if options.config:
+        config_file = options.config
+        log.info('Using config file "%s" ', options.config)
 
+#TODO
+    #if options.configure:
+       # set up default config file
+
+    # What are we working with?
     if sys.stdin.isatty():
         if len(args) == 0:
-            log.critical('No input file')
+            log.critical('No input file to process.')
             sys.exit(2)
-        data = open(args[0]).read()
+        try:
+            data = open(args[0]).read()
+        except IOError:
+            log.critical('Could not open input file "%s"', args[0])
+            sys.exit(2)
     else:
         data = sys.stdin.read()
 
+    try:
+       config = open(config_file).read()
+    except IOError:
+        log.critical('Missing configuration "'+config_file+'". Try with --configure.')
+        sys.exit(1)
+
+    # Import the XML config
+    try:
+        config = ElementTree.parse(config_file)
+    except ElementTree.ParseError as pe:
+        log.critical("XML error in '"+config_file+"' - %s", pe)
+        sys.exit(1)
+
+    config = config.getroot()
+
     processors = [
-        BBCWorldOnTV1('tv1.freeviewnz.tv'),
-        PlusOnes('tv3-plus1.freeviewnz.tv'),
-        SearchReplaceTitle(),
-        Subtitle(),
-        Categories(),
-        Movies(),
-        HD(),
-        EpDesc(),
-        Overrides(),
+# bbc world is no longer on tv1 at nights. sadly. legacy code is here incase it returns.
+#        BBCWorldOnTV1('tv1.freeviewnz.tv'),
+
+# flags plus one programs as repeats. not implemented. not sure what the value is at this stage.
+#        PlusOnes('tv3-plus1.freeviewnz.tv'),
+
+        SearchReplaceTitle(config), # tidy up show titles that have been mangled by the nz broadcasters
+        Subtitle(),                 # extract the show sub-title from the title, which is often where
+                                    # the stupid nz broadcasters put it.
+        EpDesc(),                   # find season/episode in the description
+        Categories(config),         # add categories to known shows
+        HD(),                       # check the description for clues the show in in HD and flag accordingly
+        Movies(config),             # augment the guide data with info from TMDB
+        Episodes(config),           # augment the guide data with info from TVDB
+
+# overrides is not implemented
+#        Overrides(config),
     ]
 
     tree = ElementTree.XML(data)
@@ -752,10 +1083,10 @@ if __name__ == '__main__':
         log.exception("Failed post processing with processor: %s", processor)
 
     for programme in tree.findall('.//programme'):
-        programme[:] = sorted(programme, compare_programme)
+        programme[:] = sorted(programme, key=compare_programme)
 
     indent(tree)
-    print '<?xml version="1.0" encoding="utf-8"?>'
-    print '<!DOCTYPE tv SYSTEM "xmltv.dtd">'
-    print ElementTree.tostring(tree, encoding='utf-8')
+    print('<?xml version="1.0" encoding="utf-8"?>')
+    print('<!DOCTYPE tv SYSTEM "xmltv.dtd">')
+    print(ElementTree.tostring(tree, encoding='unicode', method='xml'))
 
